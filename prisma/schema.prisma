@@ -1,0 +1,382 @@
+// =========================================================================
+// Prisma Schema: NewMark Platform Ultra
+// Distributed Multi-Tenant Architecture with Row-Level Security,
+// Dynamic Custom Objects, FEFO/FIFO Inventory, & Agent Audit Traces
+// =========================================================================
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// -------------------------------------------------------------------------
+// 1. Multi-Tenant Identity & Access Management (RBAC)
+// -------------------------------------------------------------------------
+
+enum TenantTier {
+  FREE
+  PROFESSIONAL
+  ENTERPRISE_ULTRA
+  GOVERNMENT_AIR_GAPPED
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  DEPROVISIONING
+}
+
+model Tenant {
+  id                    String                 @id @default(uuid())
+  name                  String                 @db.VarChar(255)
+  slug                  String                 @unique @db.VarChar(64)
+  tier                  TenantTier             @default(ENTERPRISE_ULTRA)
+  status                TenantStatus           @default(ACTIVE)
+  config                Json?                  @default("{}")
+  createdAt             DateTime               @default(now()) @map("created_at")
+  updatedAt             DateTime               @updatedAt @map("updated_at")
+
+  users                 User[]
+  roles                 Role[]
+  customObjects         CustomObject[]
+  records               Record[]
+  auditLogs             AuditLog[]
+  warehouses            Warehouse[]
+  inventoryBatches      InventoryBatch[]
+  inventoryThresholds   InventoryThreshold[]
+  purchaseOrders        PurchaseOrder[]
+  financialTransactions FinancialTransaction[]
+  agentExecutionLogs    AgentExecutionLog[]
+
+  @@index([slug])
+  @@index([status])
+  @@map("tenants")
+}
+
+model Role {
+  id          String   @id @default(uuid())
+  tenantId    String   @map("tenant_id")
+  name        String   @db.VarChar(64)
+  description String?  @db.VarChar(255)
+  permissions Json     // String[] e.g., ["inventory:read", "inventory:write", "po:approve", "schema:manage"]
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  users       User[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("roles")
+}
+
+model User {
+  id           String       @id @default(uuid())
+  tenantId     String       @map("tenant_id")
+  roleId       String       @map("role_id")
+  email        String       @db.VarChar(255)
+  fullName     String       @map("full_name") @db.VarChar(255)
+  passwordHash String       @map("password_hash") @db.VarChar(255)
+  isActive     Boolean      @default(true) @map("is_active")
+  lastLoginAt  DateTime?    @map("last_login_at")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  role         Role         @relation(fields: [roleId], references: [id])
+  auditLogs    AuditLog[]
+  records      Record[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId, email])
+  @@map("users")
+}
+
+// -------------------------------------------------------------------------
+// 2. Dynamic Schema & Object Manager (Extensible Metadata Layer)
+// -------------------------------------------------------------------------
+
+model CustomObject {
+  id           String        @id @default(uuid())
+  tenantId     String        @map("tenant_id")
+  name         String        @db.VarChar(128)
+  apiName      String        @map("api_name") @db.VarChar(128)
+  description  String?       @db.Text
+  icon         String?       @default("Box") @db.VarChar(64)
+  primaryField String        @default("name") @map("primary_field") @db.VarChar(64)
+  isSystem     Boolean       @default(false) @map("is_system")
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  fields       CustomField[]
+  records      Record[]
+
+  @@unique([tenantId, apiName])
+  @@index([tenantId, apiName])
+  @@map("custom_objects")
+}
+
+enum FieldType {
+  STRING
+  NUMBER
+  BOOLEAN
+  DATE
+  ENUM
+  JSON
+  RELATION
+}
+
+model CustomField {
+  id              String       @id @default(uuid())
+  customObjectId  String       @map("custom_object_id")
+  name            String       @db.VarChar(128)
+  apiName         String       @map("api_name") @db.VarChar(128)
+  type            FieldType    @default(STRING)
+  isRequired      Boolean      @default(false) @map("is_required")
+  isUnique        Boolean      @default(false) @map("is_unique")
+  defaultValue    String?      @map("default_value")
+  validationRules Json?        @default("{}") @map("validation_rules")
+  createdAt       DateTime     @default(now()) @map("created_at")
+
+  customObject    CustomObject @relation(fields: [customObjectId], references: [id], onDelete: Cascade)
+
+  @@unique([customObjectId, apiName])
+  @@index([customObjectId])
+  @@map("custom_fields")
+}
+
+model Record {
+  id             String       @id @default(uuid())
+  tenantId       String       @map("tenant_id")
+  customObjectId String       @map("custom_object_id")
+  data           Json         // Dynamically validated document payload
+  createdBy      String?      @map("created_by")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+
+  tenant         Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customObject   CustomObject @relation(fields: [customObjectId], references: [id], onDelete: Cascade)
+  creator        User?        @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, customObjectId])
+  @@index([createdAt])
+  @@map("records")
+}
+
+// -------------------------------------------------------------------------
+// 3. Inventory Domain: Warehouses, Batches (FEFO/FIFO), & Thresholds
+// -------------------------------------------------------------------------
+
+model Warehouse {
+  id          String           @id @default(uuid())
+  tenantId    String           @map("tenant_id")
+  code        String           @db.VarChar(32)
+  name        String           @db.VarChar(255)
+  location    String           @db.VarChar(255)
+  capacity    Int              @default(10000)
+  active      Boolean          @default(true)
+  createdAt   DateTime         @default(now()) @map("created_at")
+
+  tenant      Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  batches     InventoryBatch[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("warehouses")
+}
+
+enum BatchStatus {
+  AVAILABLE
+  RESERVED
+  EXPIRED
+  QUARANTINED
+}
+
+model InventoryBatch {
+  id                String      @id @default(uuid())
+  tenantId          String      @map("tenant_id")
+  warehouseId       String      @map("warehouse_id")
+  sku               String      @db.VarChar(64)
+  productName       String      @map("product_name") @db.VarChar(255)
+  batchNumber       String      @map("batch_number") @db.VarChar(64)
+  quantity          Int         @default(0)
+  allocatedQuantity Int         @default(0) @map("allocated_quantity")
+  unitCost          Float       @map("unit_cost")
+  receivedDate      DateTime    @default(now()) @map("received_date")
+  expirationDate    DateTime    @map("expiration_date")
+  status            BatchStatus @default(AVAILABLE)
+  createdAt         DateTime    @default(now()) @map("created_at")
+  updatedAt         DateTime    @updatedAt @map("updated_at")
+
+  tenant            Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  warehouse         Warehouse   @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, sku, expirationDate]) // Key index for FEFO query efficiency
+  @@index([warehouseId])
+  @@map("inventory_batches")
+}
+
+model InventoryThreshold {
+  id                  String   @id @default(uuid())
+  tenantId            String   @map("tenant_id")
+  sku                 String   @db.VarChar(64)
+  minThreshold        Int      @default(50) @map("min_threshold")
+  targetStockLevel    Int      @default(500) @map("target_stock_level")
+  reorderQuantity     Int      @default(200) @map("reorder_quantity")
+  autoRestockEnabled  Boolean  @default(true) @map("auto_restock_enabled")
+  primarySupplierId   String   @map("primary_supplier_id") @db.VarChar(64)
+  supplierLeadDays    Int      @default(3) @map("supplier_lead_days")
+  lastTriggeredAt     DateTime? @map("last_triggered_at")
+
+  tenant              Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, sku])
+  @@index([tenantId, sku])
+  @@map("inventory_thresholds")
+}
+
+// -------------------------------------------------------------------------
+// 4. Procurement & Financial Clearing Layer
+// -------------------------------------------------------------------------
+
+enum POStatus {
+  DRAFT
+  PENDING_SUPERVISOR_APPROVAL
+  APPROVED
+  REJECTED
+  FULFILLED
+  CANCELLED
+}
+
+model PurchaseOrder {
+  id                   String                 @id @default(uuid())
+  tenantId             String                 @map("tenant_id")
+  poNumber             String                 @unique @map("po_number") @db.VarChar(64)
+  supplierId           String                 @map("supplier_id") @db.VarChar(64)
+  supplierName         String                 @map("supplier_name") @db.VarChar(255)
+  status               POStatus               @default(PENDING_SUPERVISOR_APPROVAL)
+  totalAmount          Float                  @map("total_amount")
+  currency             String                 @default("USD") @db.VarChar(8)
+  notes                String?                @db.Text
+  triggerReason        String?                @map("trigger_reason") @db.VarChar(255)
+  requestedByAgent     String?                @map("requested_by_agent") @db.VarChar(64)
+  approvedBy           String?                @map("approved_by") @db.VarChar(64)
+  approvedAt           DateTime?              @map("approved_at")
+  createdAt            DateTime               @default(now()) @map("created_at")
+  updatedAt            DateTime               @updatedAt @map("updated_at")
+
+  tenant               Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  lineItems            POLineItem[]
+  financialTransaction FinancialTransaction?
+
+  @@index([tenantId, status])
+  @@index([poNumber])
+  @@map("purchase_orders")
+}
+
+model POLineItem {
+  id              String        @id @default(uuid())
+  purchaseOrderId String        @map("purchase_order_id")
+  sku             String        @db.VarChar(64)
+  productName     String        @map("product_name") @db.VarChar(255)
+  quantity        Int
+  unitPrice       Float         @map("unit_price")
+  totalAmount     Float         @map("total_amount")
+
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  @@index([purchaseOrderId])
+  @@map("po_line_items")
+}
+
+enum MatchStatus {
+  PENDING_INVOICE
+  THREE_WAY_MATCHED
+  PRICE_VARIANCE_FLAGGED
+  QUANTITY_DISCREPANCY
+}
+
+model FinancialTransaction {
+  id              String        @id @default(uuid())
+  tenantId        String        @map("tenant_id")
+  purchaseOrderId String        @unique @map("purchase_order_id")
+  invoiceNumber   String        @map("invoice_number") @db.VarChar(64)
+  amount          Float
+  currency        String        @default("USD") @db.VarChar(8)
+  matchStatus     MatchStatus   @default(THREE_WAY_MATCHED) @map("match_status")
+  isDisbursed     Boolean       @default(false) @map("is_disbursed")
+  disbursedAt     DateTime?     @map("disbursed_at")
+  disbursedBy     String?       @map("disbursed_by") @db.VarChar(64)
+  ledgerHash      String        @map("ledger_hash") @db.VarChar(128)
+  createdAt       DateTime      @default(now()) @map("created_at")
+
+  tenant          Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, matchStatus])
+  @@map("financial_transactions")
+}
+
+// -------------------------------------------------------------------------
+// 5. Enterprise Audit Logs & Multi-Agent Execution Telemetry
+// -------------------------------------------------------------------------
+
+model AuditLog {
+  id            String   @id @default(uuid())
+  tenantId      String   @map("tenant_id")
+  userId        String?  @map("user_id")
+  action        String   @db.VarChar(64)
+  entityType    String   @map("entity_type") @db.VarChar(64)
+  entityId      String   @map("entity_id") @db.VarChar(64)
+  payloadBefore Json?    @map("payload_before")
+  payloadAfter  Json?    @map("payload_after")
+  ipAddress     String?  @map("ip_address") @db.VarChar(45)
+  timestamp     DateTime @default(now())
+
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user          User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, entityType, entityId])
+  @@index([timestamp])
+  @@map("audit_logs")
+}
+
+enum AgentRole {
+  SUPERVISOR
+  OPS_INVENTORY
+  FINANCE
+  SECURITY_GUARDIAN
+}
+
+enum AgentLogStatus {
+  SUCCESS
+  FAILURE
+  ESCALATED
+  RETRYING
+}
+
+model AgentExecutionLog {
+  id             String         @id @default(uuid())
+  tenantId       String         @map("tenant_id")
+  sessionId      String         @map("session_id") @db.VarChar(128)
+  agentRole      AgentRole      @map("agent_role")
+  toolName       String         @map("tool_name") @db.VarChar(128)
+  inputPayload   Json           @map("input_payload")
+  outputPayload  Json           @map("output_payload")
+  executionMs    Int            @map("execution_ms")
+  status         AgentLogStatus @default(SUCCESS)
+  errorMessage   String?        @map("error_message") @db.Text
+  createdAt      DateTime       @default(now()) @map("created_at")
+
+  tenant         Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, sessionId])
+  @@index([agentRole])
+  @@index([createdAt])
+  @@map("agent_execution_logs")
+}

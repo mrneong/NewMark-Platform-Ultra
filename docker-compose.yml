@@ -1,0 +1,148 @@
+version: '3.9'
+
+services:
+  # -------------------------------------------------------------------------
+  # 1. Distributed OLTP Relational Database (PostgreSQL 16 High Availability)
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: newmark-postgres-node1
+    environment:
+      POSTGRES_DB: newmark_ultra
+      POSTGRES_USER: newmark_admin
+      POSTGRES_PASSWORD: enterprise_secure_password_9921
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U newmark_admin -d newmark_ultra"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2048M
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    networks:
+      - newmark_mesh
+
+  # -------------------------------------------------------------------------
+  # 2. Redis Cluster / Distributed Cache & Redlock Coordinator
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: newmark-redis-core
+    command: redis-server --requirepass redis_ultra_token_4829 --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis_ultra_token_4829", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1024M
+    networks:
+      - newmark_mesh
+
+  # -------------------------------------------------------------------------
+  # 3. Distributed Event Streaming (Redpanda / Kafka API Compatible)
+  # -------------------------------------------------------------------------
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.2
+    container_name: newmark-kafka-broker
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+      - --pandaproxy-addr=0.0.0.0:8082
+      - --advertise-pandaproxy-addr=localhost:8082
+    ports:
+      - "9092:9092"
+      - "8082:8082"
+      - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -i healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks:
+      - newmark_mesh
+
+  # -------------------------------------------------------------------------
+  # 4. Redpanda Console (Kafka Event Stream Visualizer)
+  # -------------------------------------------------------------------------
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.5.2
+    container_name: newmark-kafka-console
+    environment:
+      KAFKA_BROKERS: redpanda:29092
+      KAFKA_SCHEMAREGISTRY_ENABLED: 'false'
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks:
+      - newmark_mesh
+
+  # -------------------------------------------------------------------------
+  # 5. NewMark Ultra Operating System Application Service
+  # -------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: newmark-ultra-os
+    restart: always
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://newmark_admin:enterprise_secure_password_9921@postgres:5432/newmark_ultra?schema=public&sslmode=disable
+      REDIS_URL: redis://:redis_ultra_token_4829@redis:6379
+      KAFKA_BROKERS: redpanda:29092
+      JWT_SECRET: super_secure_enterprise_jwt_secret_key_88301
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    networks:
+      - newmark_mesh
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  redpanda_data:
+    driver: local
+
+networks:
+  newmark_mesh:
+    driver: bridge

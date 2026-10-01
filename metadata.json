@@ -1,0 +1,7 @@
+{
+  "name": "NewMark Platform Ultra",
+  "description": "Autonomous Multi-Agent Distributed Enterprise Operating System featuring dynamic schema management, real-time FEFO inventory restocking, and transactional tool execution.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
